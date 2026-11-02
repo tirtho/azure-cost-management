@@ -489,6 +489,43 @@ try {
         }
     }
 
+    Test-Case 'LastMonth queries the full previous UTC calendar month for every subscription' {
+        & {
+            function Import-Module {}
+            function Read-CostConfiguration { [pscustomobject]@{ tenants = @($tenant) } }
+            function Get-CostCertificate { 'mock-cert' }
+            function Get-CostSubscriptions { $subscription; $subscription }
+            $ranges = [Collections.Generic.List[object]]::new()
+            function Get-ResourceGroupCost {
+                param($Context, $Subscription, $From, $To, $CostMoreThan, $SubscriptionTotals)
+                $ranges.Add([pscustomobject]@{ From = $From; To = $To })
+                Assert-Equal $CostMoreThan ([decimal]1)
+                $SubscriptionTotals.Add([pscustomobject]@{ Currency = 'USD'; Cost = [decimal]5 })
+            }
+            $before = [datetime]::UtcNow
+            $rows = @(& $reportPath -COST_MORE_THAN 1 -LastMonth -AsObject)
+            $after = [datetime]::UtcNow
+            Assert-Equal $ranges.Count 2
+            $from = $ranges[0].From
+            $to = $ranges[0].To
+            Assert-Equal $from.Kind ([DateTimeKind]::Utc)
+            Assert-Equal $to.Kind ([DateTimeKind]::Utc)
+            Assert-Equal $from.Day 1
+            Assert-Equal $from.TimeOfDay ([timespan]::Zero)
+            Assert-Equal $to ($from.AddMonths(1).AddSeconds(-1))
+            $earliest = [datetime]::new($before.Year, $before.Month, 1, 0, 0, 0, [DateTimeKind]::Utc)
+            $latest = [datetime]::new($after.Year, $after.Month, 1, 0, 0, 0, [DateTimeKind]::Utc)
+            Assert-Equal ($from.AddMonths(1) -ge $earliest -and $from.AddMonths(1) -le $latest) $true
+            Assert-Equal $ranges[1].From $from
+            Assert-Equal $ranges[1].To $to
+            Assert-Equal $rows.Count 1
+            Assert-Equal $rows[0].Cost ([decimal]10)
+            $ranges.Clear()
+            $text = (& $reportPath -COST_MORE_THAN 1 -LastMonth 6>&1 | Out-String)
+            Assert-Equal $text.Contains("Actual pre-tax costs: $($ranges[0].From.ToString('u')) to $($ranges[0].To.ToString('u')) (UTC)") $true
+        }
+    }
+
     Test-Case 'Report objects and partial failures preserve scope context and signal failure' {
         & {
             function Import-Module {}
@@ -879,12 +916,46 @@ try {
         }
     }
 
+    Test-Case 'Setup with no arguments and help aliases display the same help without side effects' {
+        & {
+            function Import-Module { throw 'Help must not import modules.' }
+            function az { throw 'Help must not call Azure CLI.' }
+            function Get-CostCertificate { throw 'Help must not access certificates.' }
+            $defaultHelp = (& $setupPath) -join "`n"
+            Assert-Equal $defaultHelp.Contains('Usage:') $true
+            Assert-Equal ((& $setupPath --help) -join "`n") $defaultHelp
+            Assert-Equal ((& $setupPath -Help) -join "`n") $defaultHelp
+            Assert-Equal ((& $setupPath -h) -join "`n") $defaultHelp
+            Assert-Throws { & $setupPath '--not-help' }
+            foreach ($alias in 'Help', 'h', '-help') {
+                $parameters = @{ $alias = $true; ConfigPath = (Join-Path $temp 'missing-help-config.json') }
+                $text = (& $setupPath @parameters) -join "`n"
+                Assert-Equal $text $defaultHelp
+                Assert-Equal $text.Contains('Usage:') $true
+                foreach ($option in 'TenantId', 'AppName', 'ConfigPath', 'CertificateValidityMonths',
+                    'UseDeviceCode', 'SkipDisabledSubscriptions', 'ReactivateDisabledSubscriptions', '--help') {
+                    Assert-Equal $text.Contains($option) $true
+                }
+                Assert-Equal (Test-Path -LiteralPath $parameters.ConfigPath) $false
+            }
+        }
+    }
+
+    Test-Case 'Setup rejects conflicting disabled subscription switches before signing in' {
+        Assert-Throws {
+            & $setupPath -TenantId $tenant.tenantId -SkipDisabledSubscriptions -ReactivateDisabledSubscriptions
+        } '*cannot be combined*'
+    }
+
     foreach ($scenario in @(
         @{ Name = 'Skip disabled subscriptions only when requested'; Skip = $true; Fail = ''; Existing = $false; AllDisabled = $false; RoleCalls = 4 },
         @{ Name = 'Default setup reports disabled grant failures but continues later subscriptions'; Skip = $false; Fail = '01-disabled'; Existing = $false; AllDisabled = $false; RoleCalls = 6 },
         @{ Name = 'Default setup can reuse existing access on disabled subscriptions'; Skip = $false; Fail = ''; Existing = $true; AllDisabled = $false; RoleCalls = 5 },
         @{ Name = 'Skipping disabled subscriptions does not hide enabled subscription failures'; Skip = $true; Fail = '02-enabled'; Existing = $false; AllDisabled = $false; RoleCalls = 4 },
-        @{ Name = 'All-disabled tenant explicitly reports that no access was configured'; Skip = $true; Fail = ''; Existing = $false; AllDisabled = $true; RoleCalls = 0 }
+        @{ Name = 'All-disabled tenant explicitly reports that no access was configured'; Skip = $true; Fail = ''; Existing = $false; AllDisabled = $true; RoleCalls = 0 },
+        @{ Name = 'Reactivation targets only disabled subscriptions before granting access'; Skip = $false; Fail = ''; Existing = $false; AllDisabled = $false; RoleCalls = 6; Reactivate = $true; Activation = 'Enabled' },
+        @{ Name = 'Failed reactivation does not block later subscriptions'; Skip = $false; Fail = '01-disabled'; Existing = $false; AllDisabled = $false; RoleCalls = 4; Reactivate = $true; Activation = 'Rejected' },
+        @{ Name = 'Accepted reactivation is not treated as enabled while state remains disabled'; Skip = $false; Fail = '01-disabled'; Existing = $false; AllDisabled = $false; RoleCalls = 4; Reactivate = $true; Activation = 'Disabled' }
     )) {
         Test-Case $scenario.Name {
             & {
@@ -913,8 +984,23 @@ try {
                             $accounts | ConvertTo-Json -AsArray
                         }
                         'rest --method' {
-                            @{ value = @(@{ tenantId = $tenant.tenantId; displayName = 'Test Tenant' }) } |
-                                ConvertTo-Json -Depth 4
+                            $url = $arguments[[array]::IndexOf($arguments, '--url') + 1]
+                            if ($url -like '*/providers/Microsoft.Subscription/enable?*') {
+                                Assert-Equal $arguments[2] 'POST'
+                                Assert-Equal $url 'https://management.azure.com/subscriptions/01-disabled/providers/Microsoft.Subscription/enable?api-version=2021-10-01'
+                                Assert-Equal $arguments[[array]::IndexOf($arguments, '--subscription') + 1] '01-disabled'
+                                Assert-Equal @($azCalls | Where-Object { $_[0] -eq 'role' }).Count 0
+                                if ($scenario.Activation -eq 'Rejected') { $global:LASTEXITCODE = 1 }
+                                else { '{"subscriptionId":"01-disabled"}' }
+                            }
+                            elseif ($url -like '*/subscriptions/01-disabled?*') {
+                                Assert-Equal $arguments[2] 'GET'
+                                @{ state = $scenario.Activation } | ConvertTo-Json
+                            }
+                            else {
+                                @{ value = @(@{ tenantId = $tenant.tenantId; displayName = 'Test Tenant' }) } |
+                                    ConvertTo-Json -Depth 4
+                            }
                         }
                         'ad app' {
                             @{ id = $tenant.applicationObjectId; appId = $tenant.clientId } | ConvertTo-Json
@@ -940,6 +1026,8 @@ try {
                     SkipDisabledSubscriptions = $scenario.Skip
                     WarningAction = 'Continue'
                 }
+                $reactivate = $scenario.ContainsKey('Reactivate') -and $scenario.Reactivate
+                $parameters.ReactivateDisabledSubscriptions = $reactivate
                 $warnings = [Collections.Generic.List[string]]::new()
                 $messages = [Collections.Generic.List[string]]::new()
                 $run = {
@@ -958,6 +1046,52 @@ try {
                 }
                 $roleCalls = @($azCalls | Where-Object { $_[0] -eq 'role' })
                 Assert-Equal $roleCalls.Count $scenario.RoleCalls
+                $summaryIndex = $warnings.FindIndex([Predicate[string]]{ param($message) $message.StartsWith('SUBSCRIPTION ACCESS SUMMARY:') })
+                if ($scenario.Fail -or $scenario.Skip) {
+                    Assert-Equal ($summaryIndex -ge 0) $true
+                    $issueId = if ($scenario.Fail) { $scenario.Fail } else { '01-disabled' }
+                    $summaryRows = @($warnings | Select-Object -Skip ($summaryIndex + 1))
+                    Assert-Equal $summaryRows.Count $(if ($scenario.Fail -and $scenario.Skip) { 2 } else { 1 })
+                    $summaryDetails = @($summaryRows | Where-Object { $_.Contains("($issueId)") })[0]
+                    Assert-Equal $summaryDetails.Contains("Tenant $($tenant.tenantId)") $true
+                    Assert-Equal $summaryDetails.Contains("($issueId)") $true
+                    Assert-Equal $summaryDetails.Contains('discovered state:') $true
+                    Assert-Equal $summaryDetails.Contains('Its costs may be absent from the report.') $true
+                    Assert-Equal $summaryDetails.Contains('rerun setup with the same configuration') $true
+                    if ($scenario.Skip -and -not $scenario.Fail) {
+                        Assert-Equal $summaryDetails.Contains('Skipped by request; permissions were not added or verified.') $true
+                    }
+                    else {
+                        Assert-Equal $summaryDetails.Contains('Permissions could not be configured or verified:') $true
+                        $reason = if ($reactivate -and $scenario.Activation -eq 'Disabled') {
+                            "subscription state is 'Disabled'"
+                        } else { 'Azure CLI failed' }
+                        Assert-Equal $summaryDetails.Contains($reason) $true
+                    }
+                    if ($issueId -eq '01-disabled') {
+                        Assert-Equal $summaryDetails.Contains('subscription Disabled (01-disabled), discovered state: Disabled') $true
+                    }
+                    Assert-Equal @($warnings | Select-Object -Skip ($summaryIndex + 1) |
+                        Where-Object { $_ -like '*subscription Later (03-enabled)*' }).Count 0
+                }
+                else {
+                    Assert-Equal $summaryIndex -1
+                }
+                $enableCalls = @($azCalls | Where-Object { $_ -contains 'POST' -and ($_[0] -eq 'rest') })
+                Assert-Equal $enableCalls.Count ([int]$reactivate)
+                if ($reactivate) {
+                    if ($scenario.Activation -eq 'Rejected') {
+                        Assert-Equal (($warnings -join "`n").Contains('Reactivation request failed')) $true
+                        Assert-Equal (($messages -join "`n").Contains('Reactivation request accepted:')) $false
+                    }
+                    elseif ($scenario.Activation -eq 'Disabled') {
+                        Assert-Equal (($warnings -join "`n").Contains("subscription state is 'Disabled'")) $true
+                        Assert-Equal (($messages -join "`n").Contains('Subscription enabled:')) $false
+                    }
+                    else {
+                        Assert-Equal (($messages -join "`n").Contains('Subscription enabled:')) $true
+                    }
+                }
                 if ($scenario.Skip) {
                     Assert-Equal @($roleCalls | Where-Object { $_ -contains '01-disabled' }).Count 0
                     Assert-Equal (($warnings -join "`n").Contains('Skipping disabled subscription')) $true

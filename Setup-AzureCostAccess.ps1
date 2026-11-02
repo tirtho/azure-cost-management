@@ -3,18 +3,61 @@
 .SYNOPSIS
 Creates a certificate-backed app per tenant and grants subscription Cost Management Reader access.
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Help')]
 param(
-    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][guid[]]$TenantId,
+    [Parameter(Mandatory, ParameterSetName = 'Setup')][ValidateNotNullOrEmpty()][guid[]]$TenantId,
     [string]$AppName = 'Azure Cost Reporter',
     [string]$ConfigPath = (Join-Path $PSScriptRoot 'tenants.json'),
     [ValidateRange(1, 24)][int]$CertificateValidityMonths = 12,
     [switch]$UseDeviceCode,
-    [switch]$SkipDisabledSubscriptions
+    [switch]$SkipDisabledSubscriptions,
+        [switch]$ReactivateDisabledSubscriptions,
+        [Parameter(ParameterSetName = 'Help')][Alias('h', '-help')][switch]$Help,
+        [Parameter(Position = 0, ParameterSetName = 'Help')][ValidateSet('--help')][string]$HelpArgument
 )
+
+if ($PSCmdlet.ParameterSetName -eq 'Help') {
+        @'
+Azure cost reporting setup
+
+Creates or reuses a certificate-backed app per tenant and grants subscription
+Cost Management Reader access. Requires Windows, PowerShell 7.2+, Azure CLI,
+and an interactive identity authorized to create apps and assign Azure roles.
+
+Usage:
+    .\Setup-AzureCostAccess.ps1
+    .\Setup-AzureCostAccess.ps1 -TenantId <guid[]> [options]
+    .\Setup-AzureCostAccess.ps1 -Help | -h | --help
+
+Options:
+    -TenantId <guid[]>                 Required for setup; one or more tenant IDs.
+    -AppName <string>                  App name (default: Azure Cost Reporter).
+    -ConfigPath <string>               Configuration (default: tenants.json beside script).
+    -CertificateValidityMonths <int>   Certificate lifetime: 1-24 months (default: 12).
+    -UseDeviceCode                    Use device-code login instead of browser login.
+    -SkipDisabledSubscriptions        Skip disabled subscriptions without failing setup.
+    -ReactivateDisabledSubscriptions  Request reactivation before granting access.
+    -Help, -h, --help                 Show usage without signing in or making changes.
+
+SkipDisabledSubscriptions and ReactivateDisabledSubscriptions cannot be combined.
+Reactivation requires authorization and billing eligibility; billable workloads
+may resume. Setup summarizes failed or skipped access and continues other scopes.
+Failures cause an error at the end. Rerun with the same configuration to reuse apps.
+
+Examples:
+    .\Setup-AzureCostAccess.ps1 -TenantId '11111111-1111-1111-1111-111111111111'
+    .\Setup-AzureCostAccess.ps1 -TenantId @('11111111-1111-1111-1111-111111111111',
+            '22222222-2222-2222-2222-222222222222') -SkipDisabledSubscriptions
+    .\Setup-AzureCostAccess.ps1 -TenantId '11111111-1111-1111-1111-111111111111' -ReactivateDisabledSubscriptions
+'@
+        return
+}
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($SkipDisabledSubscriptions -and $ReactivateDisabledSubscriptions) {
+    throw 'SkipDisabledSubscriptions and ReactivateDisabledSubscriptions cannot be combined.'
+}
 Import-Module (Join-Path $PSScriptRoot 'CostManagement.psm1') -Force
 if (-not $IsWindows) { throw 'Setup requires Windows and the CurrentUser certificate store.' }
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) { throw 'Install Azure CLI before running setup.' }
@@ -56,6 +99,7 @@ if (-not (Test-Path -LiteralPath (Split-Path -Parent $ConfigPath) -PathType Cont
     throw 'The configuration parent directory must exist.'
 }
 $failed = [Collections.Generic.List[string]]::new()
+$accessIssues = [Collections.Generic.List[string]]::new()
 $roleId = '72fafb9e-0641-4937-9268-a91bfd8191a3'
 
 foreach ($id in ($TenantId | Select-Object -Unique)) {
@@ -151,11 +195,35 @@ foreach ($id in ($TenantId | Select-Object -Unique)) {
         foreach ($subscription in $subscriptions) {
             if ($SkipDisabledSubscriptions -and $subscription.state -eq 'Disabled') {
                 $skippedCount++
+                $accessIssues.Add("Tenant ${tenantKey}, subscription $($subscription.name) ($($subscription.id)), discovered state: $($subscription.state). Skipped by request; permissions were not added or verified. Its costs may be absent from the report. Re-enable the subscription and rerun setup with the same configuration.")
                 Write-Warning "Skipping disabled subscription $($subscription.name) ($($subscription.id)) in tenant ${tenantKey}. No access was checked or granted; its costs may be absent from the report."
                 continue
             }
             try {
                 $scope = "/subscriptions/$($subscription.id)"
+                if ($ReactivateDisabledSubscriptions -and $subscription.state -eq 'Disabled') {
+                    Write-Warning "Requesting reactivation of $($subscription.name) ($($subscription.id)) in tenant ${tenantKey}. Billable workloads may resume."
+                    try {
+                        $null = Invoke-SetupAz -Arguments @(
+                            'rest', '--method', 'POST', '--url',
+                            "https://management.azure.com$scope/providers/Microsoft.Subscription/enable?api-version=2021-10-01",
+                            '--subscription', $subscription.id
+                        )
+                    }
+                    catch {
+                        throw "Reactivation request failed: $($_.Exception.Message) Check billing permissions and subscription eligibility in the Azure portal; payment, offer renewal, or Azure support may be required."
+                    }
+                    Write-Host "Reactivation request accepted: $($subscription.name) ($($subscription.id)). Verifying state."
+                    $current = Invoke-SetupAz -Arguments @(
+                        'rest', '--method', 'GET', '--url',
+                        "https://management.azure.com${scope}?api-version=2022-12-01",
+                        '--subscription', $subscription.id
+                    )
+                    if ($current.state -ne 'Enabled') {
+                        throw "Reactivation was requested, but subscription state is '$($current.state)'. No access was checked or granted. Wait for activation or resolve billing issues in the Azure portal, then rerun setup with the same configuration."
+                    }
+                    Write-Host "Subscription enabled: $($subscription.name) ($($subscription.id))"
+                }
                 $assignments = @(Invoke-SetupAz -Arguments @(
                     'role', 'assignment', 'list', '--scope', $scope, '--subscription', $subscription.id,
                     '--query', "[?principalId=='$($principal.id)' && ends_with(roleDefinitionId, '$roleId')]"
@@ -172,6 +240,10 @@ foreach ($id in ($TenantId | Select-Object -Unique)) {
             }
             catch {
                 $subscriptionFailures.Add($subscription.id)
+                $advice = if ($subscription.state -eq 'Disabled') {
+                    ' A disabled subscription can block new role assignments. Verify its current state, resolve reactivation or billing issues, and rerun setup with the same configuration.'
+                } else { ' Resolve the reported error and rerun setup with the same configuration.' }
+                $accessIssues.Add("Tenant ${tenantKey}, subscription $($subscription.name) ($($subscription.id)), discovered state: $($subscription.state). Permissions could not be configured or verified: $($_.Exception.Message) Its costs may be absent from the report.$advice")
                 Write-Warning "Setup failed for tenant ${tenantKey}, subscription $($subscription.name) ($($subscription.id)): $($_.Exception.Message)"
             }
         }
@@ -194,6 +266,10 @@ foreach ($id in ($TenantId | Select-Object -Unique)) {
     }
 }
 
+if ($accessIssues.Count -gt 0) {
+    Write-Warning "SUBSCRIPTION ACCESS SUMMARY: $($accessIssues.Count) subscription(s) without configured or verified access during this run. Existing access may still be present."
+    foreach ($issue in $accessIssues) { Write-Warning $issue }
+}
 if ($failed.Count -gt 0) {
     throw "Setup incomplete for: $($failed -join ', '). Fix the reported errors and rerun with the same configuration."
 }

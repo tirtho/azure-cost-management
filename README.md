@@ -25,6 +25,15 @@ The scripts target the Azure public cloud, not sovereign clouds.
 
 ## 1. Run setup once
 
+Show setup usage and options without signing in or making changes:
+
+```powershell
+.\Setup-AzureCostAccess.ps1 --help
+```
+
+`-Help` and `-h` are also supported. Running the script with no arguments shows
+the same help. No tenant ID is needed for help.
+
 From this directory, in PowerShell 7:
 
 ```powershell
@@ -120,12 +129,51 @@ grant can be reused, but a missing grant cannot be created until the
 subscription is re-enabled. Failures no longer block later subscriptions in
 the same tenant.
 
+At the end of setup, a **SUBSCRIPTION ACCESS SUMMARY** warning lists every
+subscription whose access failed or was explicitly skipped, with tenant ID,
+subscription name and ID, state at discovery, failure or skip reason, and
+remediation guidance. It warns that these subscriptions' costs may be absent
+from the report. Unverified access is not necessarily missing access: an existing
+grant may still be present. Failed scopes still make setup throw after the
+summary; explicitly skipped scopes alone do not.
+
 Keep the same configuration to reuse apps and certificates. After re-enabling
 a subscription, rerun setup to grant its missing access. This switch does not
 re-enable subscriptions or filter cost reporting: a disabled subscription with
 existing app access can still be queried, but one without access may be absent
 from the report. An all-skipped tenant may have no subscriptions visible to the
 reporting app, which the report treats as an error rather than zero cost.
+
+### Request reactivation of disabled subscriptions
+
+To request reactivation before setting up subscription access, run:
+
+```powershell
+.\Setup-AzureCostAccess.ps1 -TenantId @(
+  '11111111-1111-1111-1111-111111111111',
+  '22222222-2222-2222-2222-222222222222'
+) -ReactivateDisabledSubscriptions
+```
+
+**This is opt-in and may allow billable workloads to resume.** It uses the
+interactive setup identity, not the read-only reporting app, and applies only
+to visible subscriptions in state `Disabled` in the selected tenants. It cannot
+be combined with `-SkipDisabledSubscriptions`. Default behavior is unchanged.
+
+Setup sends the documented [Subscription Enable request](https://learn.microsoft.com/rest/api/subscription/subscription/enable?view=rest-subscription-2021-10-01),
+then reads the subscription state directly from ARM. An accepted request is not
+reported as successful activation unless the state is `Enabled`. If activation
+is rejected, state verification fails, or the subscription is not yet enabled,
+setup records a failure, skips access setup for that subscription, and continues
+with the others. It reports an incomplete setup at the end. There is no polling;
+wait for activation and rerun with the same configuration if needed.
+
+Reactivation depends on the subscription's offer, billing status, and the setup
+identity's authorization to perform the enable operation. Cost Management Reader
+and Entra admin rights alone are insufficient. Some subscriptions require the
+billing owner to resolve payment issues, renew an expired offer, reactivate in
+the Azure portal, or contact Azure support. The script does not bypass those
+requirements or create support tickets. Cost reporting remains read-only.
 
 ## 2. Run an unattended cost report
 
@@ -134,6 +182,16 @@ Run as the **same Windows user on the same machine** that ran setup:
 ```powershell
 .\Get-AzureResourceGroupCost.ps1 -COST_MORE_THAN 100
 ```
+
+For the previous full calendar month instead of month-to-date, add `-LastMonth`:
+
+```powershell
+.\Get-AzureResourceGroupCost.ps1 -COST_MORE_THAN 100 -LastMonth
+```
+
+The range is UTC, from the first day of the previous month at midnight through
+its last day at 23:59:59. The switch also works with `-TenantId` and `-AsObject`;
+both resource-group costs and tenant totals use the selected period.
 
 Example shape (illustrative values):
 
@@ -173,7 +231,8 @@ access to its certificate store. It never falls back to interactive login.
 ### Cost semantics and failures
 
 - One UTC time range is captured for the run: the first day of the current
-  calendar month at midnight through the start of the report.
+  calendar month at midnight through the start of the report, or the full
+  previous calendar month when `-LastMonth` is specified.
 - Uses the Cost Management Query API with **ActualCost**, summed **PreTaxCost**
   by resource group. This is not a forecast or an amortized-cost report.
 - Filtering is **strictly greater than** `COST_MORE_THAN`, applied after summing

@@ -1,14 +1,15 @@
 #Requires -Version 7.2
 <#
 .SYNOPSIS
-Reports current-month resource group costs above COST_MORE_THAN and unfiltered per-tenant totals.
+Reports current-month or last-month resource group costs above COST_MORE_THAN and unfiltered per-tenant totals.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][ValidateScript({ $_ -ge 0 })][decimal]$COST_MORE_THAN,
     [string]$ConfigPath = (Join-Path $PSScriptRoot 'tenants.json'),
     [guid[]]$TenantId,
-    [switch]$AsObject
+    [switch]$AsObject,
+    [switch]$LastMonth
 )
 
 Set-StrictMode -Version Latest
@@ -25,6 +26,10 @@ if ($TenantId) {
 }
 $to = [datetime]::UtcNow
 $from = [datetime]::new($to.Year, $to.Month, 1, 0, 0, 0, [DateTimeKind]::Utc)
+if ($LastMonth) {
+    $to = $from.AddSeconds(-1)
+    $from = $from.AddMonths(-1)
+}
 $results = [Collections.Generic.List[object]]::new()
 $failures = [Collections.Generic.List[string]]::new()
 $tenantReadNotes = @{}
